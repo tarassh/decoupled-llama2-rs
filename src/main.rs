@@ -126,7 +126,7 @@ fn main() ->Result<(), Box<dyn std::error::Error>> {
     let port = matches
         .get_one::<u16>("port")
         .copied()
-        .unwrap_or(8080);
+        .unwrap_or(8010);
 
     // Debug output
     println!("Checkpoint: {}", checkpoint);
