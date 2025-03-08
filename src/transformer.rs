@@ -9,6 +9,8 @@ use std::thread;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use serde::{Serialize, Deserialize};
+use std::sync::mpsc;
+use ctrlc;
 
 // Configuration for the transformer architecture
 #[derive(Debug, Clone)]
@@ -599,6 +601,32 @@ impl TransformerServer {
 
         Ok(s.logits.clone())
     }
+
+    // Run the server in blocking mode until shutdown
+    pub fn run_blocking(&mut self, address: &str) -> Result<(), Box<dyn std::error::Error>> {
+        // Start the server
+        self.start(address)?;
+        
+        println!("Server started and running on {}. Press Ctrl+C to stop.", address);
+        
+        // Create a channel to listen for shutdown signals
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        
+        // Set up a Ctrl+C handler
+        ctrlc::set_handler(move || {
+            println!("Received shutdown signal. Gracefully shutting down...");
+            let _ = shutdown_tx.send(());
+        })?;
+        
+        // Block until we receive a shutdown signal
+        let _ = shutdown_rx.recv();
+        
+        // Stop the server
+        self.stop();
+        println!("Server shutdown complete.");
+        
+        Ok(())
+    }
 }
 
 // Helper implementation for RunState
@@ -708,4 +736,52 @@ fn memory_map_weights(
     };
 
     Ok(weights)
+}
+
+// Example function showing how to use the client-server over the internet
+#[allow(dead_code)]
+pub fn example_internet_client_server_usage() -> Result<(), Box<dyn std::error::Error>> {
+    // This is a simplified example - in real usage, the server and client would be on different machines
+    
+    // ---------- Server Example -----------
+    // Use this in the main function when running in server mode
+    #[allow(dead_code)]
+    fn run_server() -> Result<(), Box<dyn std::error::Error>> {
+        // Initialize server
+        let mut server = TransformerServer::new("path/to/your/checkpoint.bin")?;
+        
+        // Run in blocking mode - this will keep the process alive until Ctrl+C
+        server.run_blocking("127.0.0.1:3000")?;
+        
+        Ok(())
+    }
+    
+    // ---------- Client Example -----------
+    // Use this in the main function when running in client mode
+    #[allow(dead_code)]
+    fn run_client() -> Result<(), Box<dyn std::error::Error>> {
+        // Initialize client
+        let mut client = TransformerClient::new("path/to/your/checkpoint.bin")?;
+        
+        // Connect to server
+        client.connect("127.0.0.1:3000")?;
+        println!("Client connected to server");
+        
+        // Example: Send a token and receive result synchronously
+        let token = 100; // Example token ID
+        let pos = 0;     // Position in sequence
+        
+        let result = client.forward(token, pos)?;
+        println!("Received result from server with {} elements", result.len());
+        
+        // Disconnect client
+        client.disconnect()?;
+        
+        Ok(())
+    }
+    
+    // For demonstration purposes, we're just returning Ok
+    // In a real application, you would call either run_server() or run_client()
+    // based on command line arguments
+    Ok(())
 }

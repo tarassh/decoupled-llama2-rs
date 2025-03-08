@@ -1,0 +1,32 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Server",
+            "program": "${workspaceFolder}/target/debug/decoupled-llama2-rs",
+            "args": ["stories42M.bin", "-t", "0.1", "-n", "256", "-i", "One day, Lily met a Shoggoth", "-m", "server"],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "RUST_LOG": "debug"
+            },
+            "preLaunchTask": "rust: cargo build"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Client",
+            "program": "${workspaceFolder}/target/debug/decoupled-llama2-rs",
+            "args": ["stories42M.bin", "-t", "0.1", "-n", "256", "-i", "One day, Lily met a Shoggoth", "-m", "client"],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "RUST_LOG": "debug"
+            },
+            "preLaunchTask": "rust: cargo build"
+        }
+    ]
+}
