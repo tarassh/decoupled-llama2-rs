@@ -124,9 +124,14 @@ impl TransformerClient {
     // Connect to a server over the network
     pub fn connect(&mut self, server_address: &str) -> Result<(), Box<dyn std::error::Error>> {
         let stream = TcpStream::connect(server_address)?;
-        // Set timeouts for read/write operations
+        
+        // Set timeouts instead of non-blocking mode
         stream.set_read_timeout(Some(Duration::from_secs(30)))?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        
+        // Use blocking mode with timeouts
+        stream.set_nonblocking(false)?;
+        
         self.connection = Some(stream);
         Ok(())
     }
@@ -177,10 +182,18 @@ impl TransformerClient {
             // Send the actual data
             stream.write_all(&serialized)?;
             
+            // Ensure data is sent immediately
+            stream.flush()?;
+            
             // Read the response length
             let mut len_bytes = [0u8; 8];
             stream.read_exact(&mut len_bytes)?;
             let response_len = u64::from_le_bytes(len_bytes) as usize;
+            
+            // Sanity check for response size
+            if response_len > 100_000_000 {
+                return Err(format!("Response too large: {} bytes", response_len).into());
+            }
             
             // Read the response data
             let mut response_data = vec![0u8; response_len];
@@ -198,7 +211,86 @@ impl TransformerClient {
             return Ok(response.logits);
         }
         
-        Err("Not connected to server".into())
+        // If not connected to server, return the embedding directly
+        Ok(token_embedding)
+    }
+
+    // Non-blocking version using a separate thread
+    pub fn forward_async(&self, token: i32, pos: i32, 
+                         callback: impl FnOnce(Result<Vec<f32>, Box<dyn std::error::Error>>) + Send + 'static) 
+                         -> Result<(), Box<dyn std::error::Error>> {
+        // Clone necessary data for the thread
+        let p = &self.config;
+        let w = &self.weights;
+        let dim = p.dim as usize;
+        
+        // Get the token embedding
+        let content_row =
+            &w.token_embedding_table[token as usize * dim..(token as usize + 1) * dim];
+        
+        let mut token_embedding = vec![0.0; dim];
+        token_embedding.copy_from_slice(content_row);
+        
+        // Clone the connection if it exists
+        if let Some(stream) = &self.connection {
+            let mut stream_clone = stream.try_clone()?;
+            let request_id = self.request_counter;
+            
+            // Spawn a thread to handle the request asynchronously
+            thread::spawn(move || {
+                let request = ClientRequest {
+                    token_embedding: token_embedding.clone(),
+                    position: pos,
+                    request_id,
+                };
+                
+                // Process request in background thread
+                let result = (|| -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+                    // Serialize the request
+                    let serialized = bincode::serialize(&request)?;
+                    
+                    // Send length + data
+                    let len = serialized.len() as u64;
+                    stream_clone.write_all(&len.to_le_bytes())?;
+                    stream_clone.write_all(&serialized)?;
+                    stream_clone.flush()?;
+                    
+                    // Read response length
+                    let mut len_bytes = [0u8; 8];
+                    stream_clone.read_exact(&mut len_bytes)?;
+                    let response_len = u64::from_le_bytes(len_bytes) as usize;
+                    
+                    // Sanity check for response size
+                    if response_len > 100_000_000 {
+                        return Err(format!("Response too large: {} bytes", response_len).into());
+                    }
+                    
+                    // Read response data
+                    let mut response_data = vec![0u8; response_len];
+                    stream_clone.read_exact(&mut response_data)?;
+                    
+                    // Deserialize response
+                    let response: ServerResponse = bincode::deserialize(&response_data)?;
+                    
+                    // Verify it's the right response
+                    if response.request_id != request_id {
+                        return Err(format!("Received response for wrong request: expected {} got {}", 
+                                         request_id, response.request_id).into());
+                    }
+                    
+                    Ok(response.logits)
+                })();
+                
+                // Call the callback with the result
+                callback(result);
+            });
+            
+            return Ok(());
+        }
+        
+        // If not connected, call callback with just the embedding
+        callback(Ok(token_embedding));
+        Ok(())
     }
 }
 
@@ -293,81 +385,99 @@ impl TransformerServer {
                         thread::spawn(move || {
                             println!("Starting client handler thread");
                             
-                            // Create a server instance for this client
-                            let config_clone = client_config.clone(); // Clone for RunState::new
-                            let mut server = TransformerServer {
-                                config: client_config,
-                                weights: client_weights,
-                                state: RunState::new(&config_clone),
-                                listener: None,
-                                clients: Arc::new(Mutex::new(Vec::new())),
-                                running: Arc::new(Mutex::new(false)),
-                            };
-                            
-                            // Handle client requests until disconnected or server stops
-                            while *client_running.lock().unwrap() {
-                                // Try to read a request length
-                                let mut len_bytes = [0u8; 8];
-                                let mut stream = stream.try_clone().unwrap();
-                                match stream.read_exact(&mut len_bytes) {
-                                    Ok(_) => {
-                                        let request_len = u64::from_le_bytes(len_bytes) as usize;
-                                        
-                                        // Read the request data
-                                        let mut request_data = vec![0u8; request_len];
-                                        if let Err(e) = stream.read_exact(&mut request_data) {
-                                            println!("Error reading from client: {}", e);
-                                            break;
-                                        }
-                                        
-                                        // Process the request
-                                        match bincode::deserialize::<ClientRequest>(&request_data) {
-                                            Ok(request) => {
-                                                // Process using server's forward function
-                                                match server.forward(&request.token_embedding, request.position) {
-                                                    Ok(logits) => {
-                                                        // Create the response
-                                                        let response = ServerResponse {
-                                                            logits: logits.clone(),
-                                                            request_id: request.request_id,
-                                                        };
-                                                        
-                                                        // Serialize and send the response
-                                                        if let Ok(serialized) = bincode::serialize(&response) {
-                                                            let len = serialized.len() as u64;
-                                                            if let Err(e) = stream.write_all(&len.to_le_bytes()) {
-                                                                println!("Error sending response length: {}", e);
+                            // Make a mutable copy of the stream for this thread
+                            match stream.try_clone() {
+                                Ok(mut client_stream) => {
+                                    // Set the client socket to blocking mode for the handler thread
+                                    if let Err(e) = client_stream.set_nonblocking(false) {
+                                        println!("Error setting socket to blocking mode: {}", e);
+                                        return;
+                                    }
+                                    
+                                    // Create a server instance for this client
+                                    let config_clone = client_config.clone(); // Clone for RunState::new
+                                    let mut server = TransformerServer {
+                                        config: client_config,
+                                        weights: client_weights,
+                                        state: RunState::new(&config_clone),
+                                        listener: None,
+                                        clients: Arc::new(Mutex::new(Vec::new())),
+                                        running: Arc::new(Mutex::new(false)),
+                                    };
+                                    
+                                    // Handle client requests until disconnected or server stops
+                                    while *client_running.lock().unwrap() {
+                                        // Read the request length
+                                        let mut len_bytes = [0u8; 8];
+                                        match client_stream.read_exact(&mut len_bytes) {
+                                            Ok(_) => {
+                                                let request_len = u64::from_le_bytes(len_bytes) as usize;
+                                                if request_len > 100_000_000 { // Sanity check for request size
+                                                    println!("Request too large: {} bytes", request_len);
+                                                    break;
+                                                }
+                                                
+                                                // Read the request data
+                                                let mut request_data = vec![0u8; request_len];
+                                                if let Err(e) = client_stream.read_exact(&mut request_data) {
+                                                    println!("Error reading from client: {}", e);
+                                                    break;
+                                                }
+                                                
+                                                // Process the request
+                                                match bincode::deserialize::<ClientRequest>(&request_data) {
+                                                    Ok(request) => {
+                                                        // Process using server's forward function
+                                                        match server.forward(&request.token_embedding, request.position) {
+                                                            Ok(logits) => {
+                                                                // Create the response
+                                                                let response = ServerResponse {
+                                                                    logits: logits.clone(),
+                                                                    request_id: request.request_id,
+                                                                };
+                                                                
+                                                                // Serialize and send the response
+                                                                if let Ok(serialized) = bincode::serialize(&response) {
+                                                                    let len = serialized.len() as u64;
+                                                                    if let Err(e) = client_stream.write_all(&len.to_le_bytes()) {
+                                                                        println!("Error sending response length: {}", e);
+                                                                        break;
+                                                                    }
+                                                                    if let Err(e) = client_stream.write_all(&serialized) {
+                                                                        println!("Error sending response data: {}", e);
+                                                                        break;
+                                                                    }
+                                                                    // Ensure data is sent immediately
+                                                                    if let Err(e) = client_stream.flush() {
+                                                                        println!("Error flushing data: {}", e);
+                                                                        break;
+                                                                    }
+                                                                } else {
+                                                                    println!("Error serializing response");
+                                                                    break;
+                                                                }
+                                                            },
+                                                            Err(e) => {
+                                                                println!("Error in forward pass: {}", e);
                                                                 break;
                                                             }
-                                                            if let Err(e) = stream.write_all(&serialized) {
-                                                                println!("Error sending response data: {}", e);
-                                                                break;
-                                                            }
-                                                        } else {
-                                                            println!("Error serializing response");
-                                                            break;
                                                         }
                                                     },
                                                     Err(e) => {
-                                                        println!("Error in forward pass: {}", e);
+                                                        println!("Error deserializing request: {}", e);
                                                         break;
                                                     }
                                                 }
                                             },
                                             Err(e) => {
-                                                println!("Error deserializing request: {}", e);
+                                                println!("Client disconnected: {}", e);
                                                 break;
                                             }
                                         }
-                                    },
-                                    Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                                        // No data available yet, sleep a bit
-                                        thread::sleep(Duration::from_millis(10));
-                                    },
-                                    Err(e) => {
-                                        println!("Client disconnected: {}", e);
-                                        break;
                                     }
+                                },
+                                Err(e) => {
+                                    println!("Error cloning client socket: {}", e);
                                 }
                             }
                             
