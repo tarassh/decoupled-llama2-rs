@@ -69,13 +69,13 @@ pub struct RunState {
 struct ClientRequest {
     token_embedding: Vec<f32>,
     position: i32,
-    request_id: u64,
+    request_id: u16,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 struct ServerResponse {
     logits: Vec<f32>,
-    request_id: u64,
+    request_id: u16,
 }
 
 // Client transformer struct
@@ -84,7 +84,9 @@ pub struct TransformerClient {
     pub config: Config,
     pub weights: TransformerWeights, // the weights of the model
     connection: Option<TcpStream>,
-    request_counter: u64,
+    pub request_counter: usize,
+    pub sent_total: usize,
+    pub recv_total: usize,
 }
 
 impl TransformerClient {
@@ -118,6 +120,8 @@ impl TransformerClient {
             weights,
             connection: None,
             request_counter: 0,
+            sent_total: 0,
+            recv_total: 0,
         })
     }
 
@@ -133,6 +137,9 @@ impl TransformerClient {
         stream.set_nonblocking(false)?;
         
         self.connection = Some(stream);
+        self.request_counter = 0;
+        self.sent_total = 0;
+        self.recv_total = 0;
         Ok(())
     }
 
@@ -169,7 +176,7 @@ impl TransformerClient {
             let request = ClientRequest {
                 token_embedding: token_embedding.clone(),
                 position: pos,
-                request_id,
+                request_id: request_id as u16,
             };
             
             // Serialize the request
@@ -184,6 +191,8 @@ impl TransformerClient {
             
             // Ensure data is sent immediately
             stream.flush()?;
+
+            self.sent_total += len as usize + mem::size_of::<u64>();
             
             // Read the response length
             let mut len_bytes = [0u8; 8];
@@ -198,12 +207,14 @@ impl TransformerClient {
             // Read the response data
             let mut response_data = vec![0u8; response_len];
             stream.read_exact(&mut response_data)?;
+
+            self.recv_total += response_len + mem::size_of::<u64>();
             
             // Deserialize the response
             let response: ServerResponse = bincode::deserialize(&response_data)?;
             
             // Verify it's the response for our request
-            if response.request_id != request_id {
+            if response.request_id != request_id as u16 {
                 return Err(format!("Received response for wrong request: expected {} got {}", 
                                   request_id, response.request_id).into());
             }
@@ -241,7 +252,7 @@ impl TransformerClient {
                 let request = ClientRequest {
                     token_embedding: token_embedding.clone(),
                     position: pos,
-                    request_id,
+                    request_id: request_id as u16,
                 };
                 
                 // Process request in background thread
@@ -273,7 +284,7 @@ impl TransformerClient {
                     let response: ServerResponse = bincode::deserialize(&response_data)?;
                     
                     // Verify it's the right response
-                    if response.request_id != request_id {
+                    if response.request_id != request_id as u16 {
                         return Err(format!("Received response for wrong request: expected {} got {}", 
                                          request_id, response.request_id).into());
                     }

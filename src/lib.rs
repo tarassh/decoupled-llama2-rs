@@ -84,6 +84,9 @@ pub fn generate(
             "achieved tok/s: {}",
             (pos - 1) as f64 / (end_time - start_time) as f64 * 1000.0
         );
+        eprintln!("sent bytes/message: {}", transformer.sent_total / transformer.request_counter);
+        eprintln!("received bytes/message: {}", transformer.recv_total / transformer.request_counter);
+        eprintln!("sent messages: {}", transformer.request_counter);
     }
 
     Ok(())
