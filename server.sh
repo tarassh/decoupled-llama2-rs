@@ -7,4 +7,4 @@ cd "$(dirname "$0")"
 cargo build --release
 
 # Run the server with the specified arguments
-./target/release/decoupled-llama2-rs stories42M.bin -t 0.1 -n 256 -i "One day, Lily met a Shoggoth" -m server --address 127.0.0.1 --port 8010
+./target/release/decoupled-llama2-rs stories42M.bin -m server --address 127.0.0.1 --port 8010

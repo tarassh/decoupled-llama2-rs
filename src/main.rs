@@ -130,14 +130,7 @@ fn main() ->Result<(), Box<dyn std::error::Error>> {
 
     // Debug output
     println!("Checkpoint: {}", checkpoint);
-    println!("Temperature: {}", temperature);
-    println!("P value: {}", p_value);
-    println!("Seed: {}", seed);
-    println!("Steps: {}", steps);
-    println!("Input prompt: {}", input_prompt);
-    println!("Tokenizer: {}", tokenizer);
     println!("Mode: {}", mode);
-    println!("System prompt: {}", system_prompt);
     println!("Address: {}", address);
     println!("Port: {}", port);
 
@@ -150,6 +143,14 @@ fn main() ->Result<(), Box<dyn std::error::Error>> {
             server.run_blocking(&server_addr)?;
         } 
         "client" => {
+            println!("Temperature: {}", temperature);
+            println!("P value: {}", p_value);
+            println!("Seed: {}", seed);
+            println!("Steps: {}", steps);
+            println!("Input prompt: {}", input_prompt);
+            println!("Tokenizer: {}", tokenizer);
+            println!("System prompt: {}", system_prompt);
+
             let mut client = TransformerClient::new(checkpoint)?;
             let server_addr = format!("{}:{}", address, port);
             client.connect(&server_addr)?;
