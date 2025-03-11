@@ -1,10 +1,9 @@
 use clap::{Arg, Command};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use decoupled_llama2_rs::{TransformerClient, TransformerServer, Sampler, Tokenizer, generate};
+use decoupled_llama2_rs::{Sampler, Tokenizer, TransformerClient, TransformerServer, generate};
 
-
-fn main() ->Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let matches = Command::new("run")
         .version("1.0")
         .about("Runs the model with the specified options")
@@ -123,10 +122,7 @@ fn main() ->Result<(), Box<dyn std::error::Error>> {
         .get_one::<String>("address")
         .map(|s| s.as_str())
         .unwrap_or("127.0.0.1");
-    let port = matches
-        .get_one::<u16>("port")
-        .copied()
-        .unwrap_or(8010);
+    let port = matches.get_one::<u16>("port").copied().unwrap_or(8010);
 
     // Debug output
     println!("Checkpoint: {}", checkpoint);
@@ -141,7 +137,7 @@ fn main() ->Result<(), Box<dyn std::error::Error>> {
             // Use run_blocking to keep the server running until Ctrl+C is pressed
             let server_addr = format!("{}:{}", address, port);
             server.run_blocking(&server_addr)?;
-        } 
+        }
         "client" => {
             println!("Temperature: {}", temperature);
             println!("P value: {}", p_value);
@@ -156,10 +152,16 @@ fn main() ->Result<(), Box<dyn std::error::Error>> {
             client.connect(&server_addr)?;
 
             let mut tokenizer = Tokenizer::build_tokenizer(tokenizer, client.config.vocab_size)?;
-            
+
             let mut sampler = Sampler::new(client.config.vocab_size, temperature, p_value, seed);
 
-            generate(&mut client, &mut tokenizer, &mut sampler, &input_prompt, steps)?;
+            generate(
+                &mut client,
+                &mut tokenizer,
+                &mut sampler,
+                &input_prompt,
+                steps,
+            )?;
         }
         _ => {
             return Err("Invalid mode".into());
