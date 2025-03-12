@@ -25,8 +25,11 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone)]
-pub struct TransformerTokenTable {
+pub struct ClientTransformerWeights {
     pub token_embedding_table: Vec<f32>, // (vocab_size, dim)
+    pub rms_final_weight: Vec<f32>,      // (dim,)
+    // (optional) classifier weights for the logits, on the last layer
+    pub wcls: Option<Vec<f32>>,
 }
 
 // Weights for the transformer model
@@ -79,7 +82,7 @@ struct ClientRequest {
 
 #[derive(Serialize, Deserialize, Debug)]
 struct ServerResponse {
-    logits: Vec<f32>,
+    x: Vec<f32>,
     request_id: u16,
 }
 
@@ -87,7 +90,7 @@ struct ServerResponse {
 #[derive(Debug)]
 pub struct TransformerClient {
     pub config: Config,
-    pub tokens: TransformerTokenTable, // the token embeddings
+    pub weights: ClientTransformerWeights, // the token embeddings
     connection: Option<TcpStream>,
     pub request_counter: usize,
     pub sent_total: usize,
@@ -108,6 +111,7 @@ impl TransformerClient {
             unsafe { ptr::read_unaligned(config_bytes.as_ptr() as *const Config) };
 
         // Handle shared weights flag (negative vocab_size signals unshared weights)
+        let shared_weights = config.vocab_size > 0;
         config.vocab_size = config.vocab_size.abs();
 
         // Create memory map
@@ -116,11 +120,11 @@ impl TransformerClient {
         // Calculate the offset to weights data
         let weights_offset = mem::size_of::<Config>();
 
-        let tokens = memory_map_tokens(&config, &mmap[weights_offset..])?;
+        let tokens = memory_map_client_weights(&config, &mmap[weights_offset..], shared_weights)?;
 
         Ok(Self {
             config,
-            tokens,
+            weights: tokens,
             connection: None,
             request_counter: 0,
             sent_total: 0,
@@ -167,7 +171,7 @@ impl TransformerClient {
 
         // Get the token embedding
         let content_row =
-            &self.tokens.token_embedding_table[token as usize * dim..(token as usize + 1) * dim];
+            &self.weights.token_embedding_table[token as usize * dim..(token as usize + 1) * dim];
 
         // Create a Vec from the content_row slice
         let mut token_embedding = vec![0.0; dim];
@@ -228,11 +232,39 @@ impl TransformerClient {
                 .into());
             }
 
-            return Ok(response.logits);
+            return Ok(response.x);
         }
 
         // If not connected to server, return the embedding directly
-        Ok(token_embedding)
+        Err("Not connected to server".into())
+    }
+
+    pub fn post_forward(&mut self, x: &mut [f32]) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let w = &self.weights;
+        let p = &self.config;
+        let dim = p.dim as usize;
+
+        // Final rmsnorm
+        let mut logits = vec![0.0; p.vocab_size as usize];
+        let mut x_copy = vec![0.0; dim];
+        x_copy.copy_from_slice(x);
+        rmsnorm(&mut x_copy, &x, &self.weights.rms_final_weight, dim);
+
+        // Classifier into logits
+        if let Some(wcls) = &w.wcls {
+            matmul(&mut logits, &x_copy, wcls, dim, p.vocab_size as usize);
+        } else {
+            // If no classifier weights, use token embedding weights
+            matmul(
+                &mut logits,
+                &x_copy,
+                &w.token_embedding_table,
+                dim,
+                p.vocab_size as usize,
+            );
+        }
+
+        Ok(logits)
     }
 
     // Non-blocking version using a separate thread
@@ -248,7 +280,7 @@ impl TransformerClient {
 
         // Get the token embedding
         let content_row =
-            &self.tokens.token_embedding_table[token as usize * dim..(token as usize + 1) * dim];
+            &self.weights.token_embedding_table[token as usize * dim..(token as usize + 1) * dim];
 
         let mut token_embedding = vec![0.0; dim];
         token_embedding.copy_from_slice(content_row);
@@ -303,7 +335,7 @@ impl TransformerClient {
                         .into());
                     }
 
-                    Ok(response.logits)
+                    Ok(response.x)
                 })();
 
                 // Call the callback with the result
@@ -466,10 +498,10 @@ impl TransformerServer {
                                                             &request.token_embedding,
                                                             request.position,
                                                         ) {
-                                                            Ok(logits) => {
+                                                            Ok(x) => {
                                                                 // Create the response
                                                                 let response = ServerResponse {
-                                                                    logits: logits.clone(),
+                                                                    x: x.clone(),
                                                                     request_id: request.request_id,
                                                                 };
 
@@ -755,26 +787,7 @@ impl TransformerServer {
             }
         }
 
-        // Final rmsnorm
-        let mut x_copy = s.x.clone();
-        rmsnorm(&mut x_copy, &s.x, &w.rms_final_weight, dim);
-        s.x.copy_from_slice(&x_copy);
-
-        // Classifier into logits
-        if let Some(wcls) = &w.wcls {
-            matmul(&mut s.logits, &s.x, wcls, dim, p.vocab_size as usize);
-        } else {
-            // If no classifier weights, use token embedding weights
-            matmul(
-                &mut s.logits,
-                &s.x,
-                &w.token_embedding_table,
-                dim,
-                p.vocab_size as usize,
-            );
-        }
-
-        Ok(s.logits.clone())
+        Ok(s.x.clone())
     }
 
     // Run the server in blocking mode until shutdown
@@ -833,10 +846,19 @@ impl RunState {
     }
 }
 
-fn memory_map_tokens(
+fn memory_map_client_weights(
     config: &Config,
     weight_data: &[u8],
-) -> Result<TransformerTokenTable, Box<dyn std::error::Error>> {
+    shared_weights: bool,
+) -> Result<ClientTransformerWeights, Box<dyn std::error::Error>> {
+    let dim = config.dim as usize;
+    let hidden_dim = config.hidden_dim as usize;
+    let n_layers = config.n_layers as usize;
+    let head_size = dim / config.n_heads as usize;
+    let n_heads = config.n_heads as usize;
+    let n_kv_heads = config.n_kv_heads as usize;
+    let seq_len = config.seq_len as usize;
+
     // Convert the byte slice to f32 slice
     let weight_data = unsafe {
         std::slice::from_raw_parts(
@@ -863,12 +885,40 @@ fn memory_map_tokens(
     // Get token embeddings
     let token_embedding_table = get_weights(vocab_size * dim, false);
 
+    // Get attention weights
+    get_weights(n_layers * dim, false);
+
+    // skip query, key, value projection weights
+    get_weights(n_layers * dim * (n_heads * head_size), false);
+    get_weights(n_layers * dim * (n_kv_heads * head_size), false);
+    get_weights(n_layers * dim * (n_kv_heads * head_size), false);
+    get_weights(n_layers * (n_heads * head_size) * dim, false);
+
+    // Get FFN weights
+    get_weights(n_layers * dim, false);
+    get_weights(n_layers * dim * hidden_dim, false);
+    get_weights(n_layers * hidden_dim * dim, false);
+    get_weights(n_layers * dim * hidden_dim, false);
+
+    // Get final normalization weights
+    let rms_final_weight = get_weights(dim, false);
+
+    // Skip RoPE frequency tables
+    get_weights(seq_len * head_size / 2, true); // skip freq_cis_real
+    get_weights(seq_len * head_size / 2, true); // skip freq_cis_imag
+
     // Create the token table structure
-    let token_table = TransformerTokenTable {
+    let weights = ClientTransformerWeights {
         token_embedding_table,
+        rms_final_weight,
+        wcls: if shared_weights {
+            None
+        } else {
+            Some(get_weights(vocab_size * dim, false))
+        },
     };
 
-    Ok(token_table)
+    Ok(weights)
 }
 
 fn memory_map_weights(

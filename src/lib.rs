@@ -47,7 +47,8 @@ pub fn generate(
 
     while pos < steps {
         // Forward the transformer to get logits for the next token
-        let logits = transformer.forward(token, pos)?;
+        let mut x = transformer.forward(token, pos)?;
+        let logits = transformer.post_forward(&mut x)?;
 
         // Advance the state machine
         let next = if (pos as usize) < prompt_tokens.len() - 1 {
